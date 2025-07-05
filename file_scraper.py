@@ -13,6 +13,7 @@ visited_urls = set()
 found_files = set()
 base_domain = ""
 visited_lock = asyncio.Lock()
+credential_cache = {}  # Store credentials by domain
 
 def setup_logging(log_level="INFO", log_file=None):
     """Setup logging configuration"""
@@ -77,6 +78,166 @@ async def download_file(page, file_url, output_dir, logger):
     else:
         logger.debug(f"File already exists, skipping: {filepath}")
 
+async def identify_form_fields(page):
+    """Identify common form fields and return a mapping of field types to their selectors"""
+    field_types = {
+        "username": [],
+        "email": [],
+        "password": [],
+        "submit": []
+    }
+    
+    # Find username/email fields
+    username_selectors = await page.evaluate("""() => {
+        const inputs = Array.from(document.querySelectorAll('input[type="text"], input[type="email"], input:not([type])'));
+        return inputs.filter(el => {
+            const name = el.name ? el.name.toLowerCase() : '';
+            const id = el.id ? el.id.toLowerCase() : '';
+            const placeholder = el.placeholder ? el.placeholder.toLowerCase() : '';
+            return name.includes('user') || name.includes('email') || name.includes('login') || 
+                   id.includes('user') || id.includes('email') || id.includes('login') ||
+                   placeholder.includes('user') || placeholder.includes('email') || placeholder.includes('login');
+        }).map(el => {
+            return {
+                selector: el.id ? `#${el.id}` : (el.name ? `[name="${el.name}"]` : null),
+                name: el.name || '',
+                placeholder: el.placeholder || ''
+            };
+        }).filter(item => item.selector);
+    }""")
+    
+    # Find password fields
+    password_selectors = await page.evaluate("""() => {
+        const inputs = Array.from(document.querySelectorAll('input[type="password"]'));
+        return inputs.map(el => {
+            return {
+                selector: el.id ? `#${el.id}` : (el.name ? `[name="${el.name}"]` : null),
+                name: el.name || '',
+                placeholder: el.placeholder || ''
+            };
+        }).filter(item => item.selector);
+    }""")
+    
+    # Find submit buttons
+    submit_selectors = await page.evaluate("""() => {
+        const buttons = Array.from(document.querySelectorAll('input[type="submit"], button[type="submit"], button'));
+        return buttons.filter(el => {
+            const text = el.innerText ? el.innerText.toLowerCase() : '';
+            return text.includes('login') || text.includes('sign in') || text.includes('submit') || 
+                   el.type === 'submit';
+        }).map(el => {
+            return {
+                selector: el.id ? `#${el.id}` : (el.name ? `[name="${el.name}"]` : null),
+                text: el.innerText || ''
+            };
+        }).filter(item => item.selector);
+    }""")
+    
+    field_types["username"] = username_selectors
+    field_types["password"] = password_selectors
+    field_types["submit"] = submit_selectors
+    
+    return field_types
+
+async def has_login_form(page):
+    """Check if the page likely contains a login form"""
+    form_count = await page.evaluate("document.querySelectorAll('form').length")
+    if form_count == 0:
+        return False
+    
+    password_fields = await page.evaluate("document.querySelectorAll('input[type=\"password\"]').length")
+    if password_fields == 0:
+        return False
+        
+    return True
+
+def get_form_signature(url, fields):
+    """Generate a signature for a form based on domain and field attributes"""
+    domain = urllib.parse.urlparse(url).netloc
+    # Include username field attributes to help identify the form
+    field_signature = ""
+    if fields["username"]:
+        field_attrs = fields["username"][0].get("name", "") + fields["username"][0].get("placeholder", "")
+        field_signature = re.sub(r'\W+', '', field_attrs.lower())
+    return f"{domain}:{field_signature}"
+
+async def handle_form(page, logger, worker_id):
+    """Handle login forms by prompting user for credentials"""
+    if not await has_login_form(page):
+        return False
+    
+    logger.info(f"Worker {worker_id}: Login form detected on page {page.url}")
+    
+    current_url = page.url
+    
+    fields = await identify_form_fields(page)
+    
+    if not fields["username"] or not fields["password"]:
+        logger.info(f"Worker {worker_id}: Form detected but doesn't appear to be a login form")
+        return False
+    
+    # Check for cached credentials
+    form_signature = get_form_signature(current_url, fields)
+    cached_creds = credential_cache.get(form_signature)
+    
+    if cached_creds:
+        # Use cached credentials
+        logger.info(f"Worker {worker_id}: Using cached credentials for {urllib.parse.urlparse(current_url).netloc}")
+        username = cached_creds["username"]
+        password = cached_creds["password"]
+        print(f"\nUsing cached credentials for {urllib.parse.urlparse(current_url).netloc}")
+    else:
+        # Prompt for credentials
+        print("\n" + "="*60)
+        print(f"Login form detected on {page.url}")
+        print("="*60)
+        
+        # Get username input
+        username_field = fields["username"][0]
+        username_prompt = username_field.get('placeholder', '') or username_field.get('name', '') or 'username'
+        username = input(f"Enter username/email ({username_prompt}): ")
+        
+        # Get password input
+        password_field = fields["password"][0]
+        password = input("Enter password: ")
+    
+    try:
+        # Fill the form
+        await page.fill(fields["username"][0]["selector"], username)
+        await page.fill(fields["password"][0]["selector"], password)
+        
+        # Submit form
+        if fields["submit"]:
+            submit_selector = fields["submit"][0]["selector"]
+            logger.info(f"Worker {worker_id}: Clicking submit button")
+            
+            await page.click(submit_selector)
+            await page.wait_for_load_state('networkidle')
+        else:
+            logger.info(f"Worker {worker_id}: No submit button found, pressing Enter on password field")
+            await page.press(fields["password"][0]["selector"], "Enter")
+            await page.wait_for_load_state('networkidle')
+            
+        if page.url != current_url:
+            logger.info(f"Worker {worker_id}: Successfully logged in! New URL: {page.url}")
+            print("\nSuccessfully logged in!")
+            
+            # Cache successful credentials for future use
+            if not cached_creds:  # Only cache if we didn't use cached creds already
+                credential_cache[form_signature] = {"username": username, "password": password}
+                logger.info(f"Worker {worker_id}: Cached credentials for future use")
+            
+            return True
+        else:
+            logger.warning(f"Worker {worker_id}: Form submitted but URL didn't change")
+            print("\nForm submitted, but URL didn't change. Login might have failed.")
+            return False
+            
+    except Exception as e:
+        logger.error(f"Worker {worker_id}: Error during login: {e}")
+        print(f"\nError during login: {e}")
+        return False
+
 async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwright, worker_id, logger):
     logger.info(f"Worker {worker_id} starting")
     
@@ -86,7 +247,7 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
     
     urls_processed = 0
     files_downloaded = 0
-    idle_timeout = 10  # seconds to wait for new work
+    idle_timeout = 20  # seconds to wait for new work
 
     try:
         while True:  
@@ -132,6 +293,11 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                 
                 await page.goto(url, timeout=30000, wait_until='domcontentloaded')
                 await page.wait_for_timeout(500)
+
+                # Check if login form is present and handle it
+                logged_in = await handle_form(page, logger, worker_id)
+                if logged_in:
+                    logger.info(f"Worker {worker_id}: Successfully authenticated")
 
                 links = await page.eval_on_selector_all("a", "els => els.map(el => el.href)")
                 new_links_added = 0
