@@ -86,10 +86,18 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
     
     urls_processed = 0
     files_downloaded = 0
+    idle_timeout = 10  # seconds to wait for new work
 
     try:
-        while not queue.empty():
-            url = await queue.get()
+        while True:  # Changed from while not queue.empty()
+            try:
+                # Wait for work with timeout instead of checking empty()
+                url = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
+            except asyncio.TimeoutError:
+                # No new work after timeout, assume we're done
+                logger.info(f"Worker {worker_id}: No new URLs after {idle_timeout}s, shutting down")
+                break
+                
             urls_processed += 1
 
             async with visited_lock:
@@ -207,16 +215,13 @@ async def main(args):
     
     async with async_playwright() as playwright:
         logger.info(f"Starting {args.threads} worker threads")
-        tasks = [
-            asyncio.create_task(worker(queue, args.ext, args.output_dir, args.same_domain_only, playwright, i+1, logger))
+        await asyncio.gather(*[
+            worker(queue, args.ext, args.output_dir, args.same_domain_only, playwright, i+1, logger)
             for i in range(args.threads)
-        ]
+        ])
 
-        await queue.join()
-        logger.info("Queue processing completed, cancelling workers")
+        logger.info("All workers completed")
         
-        for t in tasks:
-            t.cancel()
 
     end_time = datetime.now()
     duration = end_time - start_time
