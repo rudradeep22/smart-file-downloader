@@ -35,7 +35,7 @@ def setup_logging(log_level="INFO", log_file=None):
     # File handler (if specified)
     if log_file:
         file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)  # Always log DEBUG to file
+        file_handler.setLevel(logging.DEBUG)  
         file_formatter = logging.Formatter(log_format)
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
@@ -89,12 +89,10 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
     idle_timeout = 10  # seconds to wait for new work
 
     try:
-        while True:  # Changed from while not queue.empty()
+        while True:  
             try:
-                # Wait for work with timeout instead of checking empty()
                 url = await asyncio.wait_for(queue.get(), timeout=idle_timeout)
             except asyncio.TimeoutError:
-                # No new work after timeout, assume we're done
                 logger.info(f"Worker {worker_id}: No new URLs after {idle_timeout}s, shutting down")
                 break
                 
@@ -110,7 +108,6 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
             logger.debug(f"Worker {worker_id}: Processing URL {urls_processed}: {url}")
 
             try:
-                # Direct file download
                 if url.lower().endswith(f".{file_ext.lower()}"):
                     logger.debug(f"Worker {worker_id}: Direct file download detected: {url}")
                     await download_file(page, url, output_dir, logger)
@@ -120,7 +117,6 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                 
                 logger.info(f"Worker {worker_id}: Visiting page: {url}")
                 
-                # Check for download URLs with matching extensions
                 if any(param in url.lower() for param in ['download', 'wpdmdl', 'file']):
                     if (f".{file_ext.lower()}" in url.lower() or 
                         any(indicator in url.lower() for indicator in [f'{file_ext}', 'attachment', 'export'])):
@@ -134,7 +130,6 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                         queue.task_done()
                         continue
                 
-                # Navigate to page and extract links
                 await page.goto(url, timeout=30000, wait_until='domcontentloaded')
                 await page.wait_for_timeout(500)
 
@@ -159,7 +154,6 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                 logger.info(f"Worker {worker_id}: Extracted {len(links)} links, added {new_links_added} new links to queue")
 
             except Exception as e:
-                # Handle ERR_ABORTED for potential download URLs
                 if ("ERR_ABORTED" in str(e) and 
                     any(param in url.lower() for param in ['download', 'wpdmdl', 'file']) and
                     (f".{file_ext.lower()}" in url.lower() or f'{file_ext}' in url.lower())):
@@ -183,7 +177,6 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
 async def main(args):
     global base_domain
     
-    # Setup logging
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"file_scraper_{timestamp}.log" if args.log_file else None
     logger = setup_logging(args.log_level, log_file)
@@ -203,7 +196,6 @@ async def main(args):
     base_domain = urllib.parse.urlparse(args.start_url).netloc
     logger.info(f"Base domain: {base_domain}")
     
-    # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     logger.info(f"Created/verified output directory: {args.output_dir}")
 
