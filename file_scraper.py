@@ -311,7 +311,6 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                 await page.goto(url, timeout=30000, wait_until='domcontentloaded')
                 await page.wait_for_timeout(500)
 
-                # Check if login form is present and handle it
                 logged_in = await handle_form(page, logger, worker_id)
                 if logged_in:
                     logger.info(f"Worker {worker_id}: Successfully authenticated")
