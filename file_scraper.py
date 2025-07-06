@@ -238,12 +238,23 @@ async def handle_form(page, logger, worker_id):
         print(f"\nError during login: {e}")
         return False
 
-async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwright, worker_id, logger):
+def can_fetch(robot_parser, url):
+    """Check if the URL is allowed to be fetched based on robots.txt"""
+    if robot_parser:
+        return robot_parser.can_fetch("*", url)
+    return True
+
+async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwright, worker_id, logger, robot_parser=None):
     logger.info(f"Worker {worker_id} starting")
     
     browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context()
     page = await context.new_page()
+    
+    # Set a custom user agent that includes your bot name
+    await context.set_extra_http_headers({
+        "User-Agent": "FileScraper/1.0 (+https://yourwebsite.com/bot)"
+    })
     
     urls_processed = 0
     files_downloaded = 0
@@ -265,6 +276,12 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                     queue.task_done()
                     continue
                 visited_urls.add(url)
+            
+            # Check robots.txt before processing URL
+            if not can_fetch(robot_parser, url):
+                logger.info(f"Worker {worker_id}: Skipping {url} - disallowed by robots.txt")
+                queue.task_done()
+                continue
 
             logger.debug(f"Worker {worker_id}: Processing URL {urls_processed}: {url}")
 
@@ -306,8 +323,11 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
                     if not is_valid_url(link):
                         continue
                     if same_domain_only and not is_internal_url(link):
-                        logger.debug(f"Worker {worker_id}: Skipping external link: {link}")
                         continue
+                    if not can_fetch(robot_parser, link):
+                        logger.debug(f"Worker {worker_id}: Skipping {link} - disallowed by robots.txt")
+                        continue
+                    
                     if link.lower().endswith(f".{file_ext.lower()}"):
                         logger.debug(f"Worker {worker_id}: Found target file link: {link}")
                         await download_file(page, link, output_dir, logger)
@@ -340,6 +360,16 @@ async def worker(queue: Queue, file_ext, output_dir, same_domain_only, playwrigh
         await browser.close()
         logger.info(f"Worker {worker_id} finished. Processed {urls_processed} URLs, downloaded {files_downloaded} files")
 
+def setup_robot_parser(start_url):
+    """Setup robots.txt parser for the given start URL"""
+    from urllib.robotparser import RobotFileParser
+    parsed_url = urllib.parse.urlparse(start_url)
+    robots_url = f"{parsed_url.scheme}://{parsed_url.netloc}/robots.txt"
+    robot_parser = RobotFileParser()
+    robot_parser.set_url(robots_url)
+    robot_parser.read()
+    return robot_parser
+
 async def main(args):
     global base_domain
     
@@ -369,12 +399,15 @@ async def main(args):
     await queue.put(args.start_url)
     logger.info("Added start URL to queue")
 
+    # Setup robots.txt parser
+    robot_parser = setup_robot_parser(args.start_url)
+
     start_time = datetime.now()
     
     async with async_playwright() as playwright:
         logger.info(f"Starting {args.threads} worker threads")
         await asyncio.gather(*[
-            worker(queue, args.ext, args.output_dir, args.same_domain_only, playwright, i+1, logger)
+            worker(queue, args.ext, args.output_dir, args.same_domain_only, playwright, i+1, logger, robot_parser)
             for i in range(args.threads)
         ])
 
